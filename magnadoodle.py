@@ -37,23 +37,22 @@ from scipy import ndimage
 # ──────────────────────────────────────────────────────────────────────────────
 # Cell-pitch detection via radial FFT
 # ──────────────────────────────────────────────────────────────────────────────
-def estimate_cell_pitch(gray: np.ndarray) -> float:
+def estimate_cell_pitch(gray: np.ndarray,
+                        pitch_min: float = 8,
+                        pitch_max: float = 35) -> float:
     """Estimate the hex-cell pitch (center-to-center distance) in pixels.
 
     The honeycomb produces a strong ring in the FFT magnitude at radius
     f = N / pitch, where N is image size. We find the dominant ring.
     """
     h, w = gray.shape
-    # Use a square central crop for clean radial averaging
     s = min(h, w)
     crop = gray[(h - s) // 2:(h - s) // 2 + s,
                 (w - s) // 2:(w - s) // 2 + s].astype(np.float32)
     crop -= crop.mean()
-    # Hann window to reduce edge artifacts
     win = np.outer(np.hanning(s), np.hanning(s))
     spec = np.abs(np.fft.fftshift(np.fft.fft2(crop * win)))
 
-    # Radial average
     cy, cx = s // 2, s // 2
     yy, xx = np.indices(spec.shape)
     r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2).astype(np.int32)
@@ -61,44 +60,49 @@ def estimate_cell_pitch(gray: np.ndarray) -> float:
     radial = np.bincount(r.ravel(), spec.ravel())[:r_max] / (
              np.bincount(r.ravel())[:r_max] + 1e-9)
 
-    # Look for the dominant peak in the relevant range:
-    # cells of pitch 5–40 px → frequency s/40 .. s/5
-    f_lo = max(3, s // 40)
-    f_hi = min(r_max - 1, s // 5)
+    f_lo = max(3, int(s / pitch_max))
+    f_hi = min(r_max - 1, int(s / pitch_min))
     band = radial[f_lo:f_hi].copy()
-    # Subtract a smooth baseline so we find true spikes
     baseline = ndimage.gaussian_filter1d(band, sigma=8)
     peaks = band - baseline
     f_peak = f_lo + int(np.argmax(peaks))
-    pitch = s / f_peak
-    return pitch
+    return s / f_peak
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Auto-crop to the drawing area
+# Find the drawing surface (low-saturation + bright region, eroded to peel
+# off the silver metallic trim that otherwise leaks into the mask)
 # ──────────────────────────────────────────────────────────────────────────────
-def auto_crop(gray: np.ndarray, margin_frac: float = 0.02) -> tuple[int, int, int, int]:
-    """Find the drawing region by looking for the largest bright rectangle.
+def find_drawing_region(
+    img_bgr: np.ndarray,
+) -> tuple[np.ndarray | None, tuple[int, int, int, int]]:
+    """Return (mask, bbox) for the drawing surface, or (None, full-frame).
 
-    The Magna Doodle drawing surface is the brightest large area in the photo;
-    the colored frame around it is much darker. Returns (x0, y0, x1, y1).
+    The Magna Doodle drawing area is uniquely low-saturation and bright. We
+    threshold on blurred saturation + value, take the largest connected blob,
+    then erode ~4% to pull inward past the silver trim and any shadow that
+    bleeds onto the surface edge.
     """
-    # Heavy blur + Otsu to find bright regions
-    blur = cv2.GaussianBlur(gray, (51, 51), 0)
-    _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Largest bright connected component
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(bw, 8)
+    H, W = img_bgr.shape[:2]
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    s, v = hsv[:, :, 1], hsv[:, :, 2]
+    blur_s = cv2.GaussianBlur(s, (31, 31), 0)
+    blur_v = cv2.GaussianBlur(v, (31, 31), 0)
+    raw = ((blur_s < 60) & (blur_v > 100)).astype(np.uint8) * 255
+    erode_px = max(8, int(min(H, W) * 0.04))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                  (erode_px * 2 + 1, erode_px * 2 + 1))
+    eroded = cv2.erode(raw, k)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(eroded, 8)
     if n <= 1:
-        return 0, 0, gray.shape[1], gray.shape[0]
-    # Skip background label 0
+        return None, (0, 0, W, H)
     biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    region = (labels == biggest).astype(np.uint8) * 255
     x = stats[biggest, cv2.CC_STAT_LEFT]
     y = stats[biggest, cv2.CC_STAT_TOP]
     w = stats[biggest, cv2.CC_STAT_WIDTH]
     h = stats[biggest, cv2.CC_STAT_HEIGHT]
-    # Inset by a small margin to avoid the rounded plastic edge
-    m = int(margin_frac * min(w, h))
-    return x + m, y + m, x + w - m, y + h - m
+    return region, (x, y, x + w, y + h)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -107,42 +111,58 @@ def auto_crop(gray: np.ndarray, margin_frac: float = 0.02) -> tuple[int, int, in
 def digitize(
     img_bgr: np.ndarray,
     cell_pitch: float | None = None,
-    bg_kernel_frac: float = 0.05,
+    region: np.ndarray | None = None,
     invert_output: bool = True,
     debug_dir: Path | None = None,
 ) -> np.ndarray:
-    """Return a clean uint8 binary image: drawing=255 on background=0
+    """Return a clean uint8 binary image: drawing=0 on background=255
     (or inverted if invert_output=False).
+
+    If `region` is provided (uint8 0/255 mask of the drawing surface), pixels
+    outside it are neutralized before thresholding and the mask is AND-ed back
+    against it at the end. Otsu's threshold is computed only over in-region
+    pixels so the drawing's contrast isn't drowned out by the dark frame.
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if img_bgr.ndim == 3 else img_bgr
+
+    if region is not None:
+        # Replace out-of-region pixels with a bright surface-like value so the
+        # blackhat response there is ~0 and doesn't bias anything.
+        bright = int(np.percentile(gray[region > 0], 90))
+        gray = np.where(region > 0, gray, bright).astype(np.uint8)
 
     if cell_pitch is None:
         cell_pitch = estimate_cell_pitch(gray)
         print(f"  detected cell pitch ≈ {cell_pitch:.1f} px")
 
-    # 1. Smooth out the hex pattern. Sigma = ~half a cell pitch is enough to
-    #    average over neighboring cells without blurring the drawing edges much.
+    # 1. Gaussian blur averages out the hex grid (sigma ~ half a cell pitch).
     sigma = max(2.0, cell_pitch * 0.45)
     smooth = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma)
 
-    # 2. Estimate slow-varying background (shadow / vignette) with a much
-    #    larger kernel, then subtract.
-    bg_size = int(min(gray.shape) * bg_kernel_frac) | 1  # force odd
-    bg_size = max(bg_size, int(cell_pitch * 6) | 1)
-    bg = cv2.morphologyEx(
-        smooth, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bg_size, bg_size))
-    )
-    flat = cv2.subtract(bg, smooth)        # drawing now BRIGHT on dark
-    flat = cv2.normalize(flat, None, 0, 255, cv2.NORM_MINMAX)
+    # 2. Black-hat: local bright-bg minus image pulls out dark strokes directly,
+    #    without needing to estimate a global shadow model. Kernel is a few
+    #    cells wide so it responds to strokes but ignores the drawing surface.
+    bh_size = int(cell_pitch * 6) | 1
+    bh = cv2.morphologyEx(
+        smooth, cv2.MORPH_BLACKHAT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bh_size, bh_size)))
+    flat = cv2.normalize(bh, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    # 3. Otsu threshold → binary mask of the drawing
-    _, mask = cv2.threshold(flat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 3. Otsu on in-region pixels only (prevents the surrounding frame from
+    #    dominating the histogram), then apply threshold globally.
+    if region is not None:
+        in_mask = region > 0
+        thr_val, _ = cv2.threshold(flat[in_mask], 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, mask = cv2.threshold(flat, int(thr_val), 255, cv2.THRESH_BINARY)
+        mask = cv2.bitwise_and(mask, region)
+    else:
+        _, mask = cv2.threshold(flat, 0, 255,
+                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 4. Morphological cleanup: drop tiny specks, close 1-2 px gaps
+    # 4. Morphological cleanup: drop tiny specks, close 1-2 px gaps.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    # Remove components smaller than a single cell
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     min_area = int((cell_pitch * 0.7) ** 2)
     cleaned = np.zeros_like(mask)
@@ -155,11 +175,11 @@ def digitize(
         debug_dir.mkdir(exist_ok=True, parents=True)
         cv2.imwrite(str(debug_dir / '01_gray.png'), gray)
         cv2.imwrite(str(debug_dir / '02_smooth.png'), smooth)
-        cv2.imwrite(str(debug_dir / '03_background.png'), bg)
         cv2.imwrite(str(debug_dir / '04_flat.png'), flat)
         cv2.imwrite(str(debug_dir / '05_mask.png'), mask)
+        if region is not None:
+            cv2.imwrite(str(debug_dir / '00_region.png'), region)
 
-    # By convention return drawing=BLACK on white background (like a scan)
     return mask if not invert_output else cv2.bitwise_not(mask)
 
 
@@ -225,19 +245,22 @@ def main() -> int:
         return 1
     print(f"Loaded {args.image.name}: {img.shape[1]}×{img.shape[0]}")
 
-    # Crop
+    # Crop + drawing-surface mask
     if args.crop:
         x0, y0, x1, y1 = args.crop
+        region = None
     elif args.no_crop:
         x0, y0, x1, y1 = 0, 0, img.shape[1], img.shape[0]
+        region = None
     else:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        x0, y0, x1, y1 = auto_crop(gray)
+        region_full, (x0, y0, x1, y1) = find_drawing_region(img)
         print(f"  auto-crop to ({x0},{y0})–({x1},{y1})")
+        region = region_full[y0:y1, x0:x1] if region_full is not None else None
     cropped = img[y0:y1, x0:x1]
 
     debug_dir = out_base.with_name(out_base.name + '_debug') if args.debug else None
-    clean = digitize(cropped, cell_pitch=args.cell, debug_dir=debug_dir)
+    clean = digitize(cropped, cell_pitch=args.cell, region=region,
+                     debug_dir=debug_dir)
 
     png_path = out_base.with_suffix('.png')
     if not args.svg_only:
