@@ -1,0 +1,20 @@
+[project]
+name = "magnadoodle"
+version = "0.1.0"
+description = "Digitize Magna Doodle drawings into clean PNG and SVG"
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.scripts]
+magnadoodle = "magnadoodle:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["magnadoodle.py"]
